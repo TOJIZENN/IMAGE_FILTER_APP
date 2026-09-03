@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from functools import lru_cache
+import hashlib
 import shutil
 import time
 from pathlib import Path
@@ -21,6 +22,13 @@ FACE_THRESHOLD = 0.68
 DETECTOR_BACKEND = "retinaface"
 MAX_PROCESSING_DIMENSION = 1600
 ARCFACE_BATCH_SIZE = 32
+
+# Duplicate-upload detection settings. Exact re-uploads are caught with a
+# byte-level hash (cheap, no decoding needed); near-identical re-encodes are
+# caught with a perceptual hash computed on the decoded pixels.
+PHASH_SIZE = 8  # final perceptual hash is PHASH_SIZE x PHASH_SIZE = 64 bits
+PHASH_HIGH_FREQ_FACTOR = 4  # DCT is computed on a (PHASH_SIZE * factor)-square image
+PHASH_HAMMING_THRESHOLD = 8  # max differing bits (out of 64) still counted as a duplicate
 
 PROJECT_DIR = Path(__file__).resolve().parent
 REFERENCE_IMAGE = PROJECT_DIR / "input" / "reference.jpg"
@@ -51,6 +59,20 @@ class ProcessingBatchResult:
     timings: ProcessingTimings = field(default_factory=ProcessingTimings)
 
 
+@dataclass
+class DeduplicationResult:
+    """Collapses duplicate uploads down to one representative copy per unique image."""
+
+    # One (name, image) entry per unique image, ready to hand to process_photos_batch.
+    unique_photos: list[tuple[str, np.ndarray | None]]
+    # Representative name -> the raw bytes first seen for that image (for display/output).
+    representative_bytes: dict[str, bytes]
+    # Every uploaded name -> the representative name whose image it duplicates.
+    name_to_representative: dict[str, str]
+    # Representative name -> every uploaded name (including itself) that shares that image.
+    duplicate_groups: dict[str, list[str]]
+
+
 @lru_cache(maxsize=1)
 def load_deepface_models() -> None:
     """Warm DeepFace's cached detector and ArcFace model once per process."""
@@ -71,6 +93,100 @@ def load_image(image_source: ImageSource) -> np.ndarray | None:
     if isinstance(image_source, np.ndarray):
         return image_source
     return cv2.imread(str(image_source))
+
+
+def compute_exact_hash(contents: bytes) -> str:
+    """Return a SHA-256 hex digest of raw file bytes.
+
+    This catches byte-identical re-uploads (the common "uploaded the same set
+    twice" case) without ever decoding the image, which is the cheapest
+    possible way to skip repeated work.
+    """
+    return hashlib.sha256(contents).hexdigest()
+
+
+def compute_perceptual_hash(image: np.ndarray) -> int:
+    """Return a 64-bit perceptual hash (pHash) that is stable across re-encoding.
+
+    Two images that look the same but differ in file format, compression, or
+    metadata (e.g. a JPEG re-saved by WhatsApp) will produce hashes with a
+    small Hamming distance, while genuinely different photos will not.
+    """
+    grayscale = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    size = PHASH_SIZE * PHASH_HIGH_FREQ_FACTOR
+    resized = cv2.resize(grayscale, (size, size), interpolation=cv2.INTER_AREA).astype(np.float32)
+    dct = cv2.dct(resized)
+    low_frequencies = dct[:PHASH_SIZE, :PHASH_SIZE]
+    # Exclude the DC term (top-left coefficient) when computing the median,
+    # which is the standard pHash refinement -- it carries only brightness.
+    median = float(np.median(low_frequencies.flatten()[1:]))
+    bits = (low_frequencies > median).flatten()
+    hash_value = 0
+    for bit in bits:
+        hash_value = (hash_value << 1) | int(bit)
+    return hash_value
+
+
+def hamming_distance(first_hash: int, second_hash: int) -> int:
+    """Count differing bits between two perceptual hashes."""
+    return bin(first_hash ^ second_hash).count("1")
+
+
+def deduplicate_photos(
+    photos: list[tuple[str, bytes]],
+    perceptual_threshold: int = PHASH_HAMMING_THRESHOLD,
+) -> DeduplicationResult:
+    """Collapse duplicate uploads to one representative copy before face processing.
+
+    Runs in two cheap passes ahead of any face detection or ArcFace inference:
+
+    1. Byte-identical uploads are caught via SHA-256 on the raw bytes, so an
+       exact re-upload is never even decoded.
+    2. Anything not caught by (1) is decoded once and compared with a
+       perceptual hash (pHash), so a re-encoded or re-saved copy of the same
+       image is *also* treated as a duplicate -- without merging photos that
+       are genuinely different (e.g. the same person standing vs. sitting).
+
+    The first-seen name for each unique image becomes its "representative",
+    and that representative is the only copy passed on to face matching.
+    """
+    unique_photos: list[tuple[str, np.ndarray | None]] = []
+    representative_bytes: dict[str, bytes] = {}
+    name_to_representative: dict[str, str] = {}
+    duplicate_groups: dict[str, list[str]] = {}
+    exact_hash_to_representative: dict[str, str] = {}
+    # Perceptual hashes of unique images seen so far, checked linearly. Batches
+    # in this kind of workflow are small (dozens to low hundreds of photos),
+    # so this stays fast without needing a similarity index.
+    seen_perceptual_hashes: list[tuple[int, str]] = []
+
+    for name, contents in photos:
+        exact_hash = compute_exact_hash(contents)
+        representative = exact_hash_to_representative.get(exact_hash)
+        image: np.ndarray | None = None
+
+        if representative is None:
+            image = decode_image(contents)
+            if image is not None:
+                photo_hash = compute_perceptual_hash(image)
+                for existing_hash, existing_name in seen_perceptual_hashes:
+                    if hamming_distance(photo_hash, existing_hash) <= perceptual_threshold:
+                        representative = existing_name
+                        break
+                if representative is None:
+                    seen_perceptual_hashes.append((photo_hash, name))
+
+        if representative is None:
+            representative = name
+            unique_photos.append((name, image))
+            representative_bytes[name] = contents
+            duplicate_groups[representative] = []
+
+        exact_hash_to_representative.setdefault(exact_hash, representative)
+        duplicate_groups[representative].append(name)
+        name_to_representative[name] = representative
+
+    return DeduplicationResult(unique_photos, representative_bytes, name_to_representative, duplicate_groups)
 
 
 def resize_for_processing(image: np.ndarray, timings: ProcessingTimings | None = None) -> np.ndarray:
@@ -327,17 +443,19 @@ def main() -> None:
         print("Photos folder is empty (no supported images found).")
         return
 
+    dedup_result = deduplicate_photos([(path.name, path.read_bytes()) for path in photo_paths])
+    duplicate_count = len(photo_paths) - len(dedup_result.unique_photos)
+    if duplicate_count:
+        print(f"Skipped {duplicate_count} duplicate upload(s) of an already-seen image.")
+
     match_count = 0
-    batch_result = process_photos_batch(
-        [(photo_path.name, photo_path) for photo_path in photo_paths],
-        reference_embedding,
-    )
+    batch_result = process_photos_batch(dedup_result.unique_photos, reference_embedding)
     for name, result, _ in batch_result.results:
         if result == "MATCH":
             shutil.copy2(PHOTOS_DIR / name, OUTPUT_DIR / name)
             match_count += 1
 
-    print(f"\nFound {match_count} matching photo(s).")
+    print(f"\nFound {match_count} unique matching photo(s).")
     print(f"Matching originals were copied to: {OUTPUT_DIR}")
 
 
