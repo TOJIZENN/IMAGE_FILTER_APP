@@ -1,0 +1,5 @@
+deepface==0.0.100
+tf-keras>=2.21.0
+opencv-python>=4.8.0
+numpy>=1.24.0
+streamlit>=1.40.0
