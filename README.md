@@ -108,4 +108,4 @@ This project does not train a model, use a database, call a cloud API, or compar
 
 Use `app.py` as the main file path and select Python 3.11 in Advanced settings. The dependency pins are chosen for the DeepFace 0.0.100, TensorFlow 2.20.0, tf-keras 2.20.1, NumPy 1.26.4, and OpenCV stack.
 
-DeepFace currently declares `opencv-python` as a required dependency, so this deployment uses one pinned `opencv-python` wheel instead of installing both OpenCV distributions. The root `packages.txt` installs `libgl1`, which Streamlit documents for unavoidable non-headless OpenCV imports on Community Cloud. Do not add `libglib2.0-0`; Streamlit Cloud's current apt environment cannot resolve its Debian Bullseye dependencies.
+DeepFace currently declares `opencv-python` as a required dependency, so this deployment uses one pinned `opencv-python` wheel instead of installing both OpenCV distributions. The root `packages.txt` installs `libgl1` plus Debian Trixie's `libglib2.0-0t64`, which provides the `libgthread-2.0.so.0` library required by OpenCV on Streamlit Community Cloud.
