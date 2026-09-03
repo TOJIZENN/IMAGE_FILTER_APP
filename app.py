@@ -13,6 +13,7 @@ from main import (
     OUTPUT_DIR,
     SUPPORTED_EXTENSIONS,
     decode_image,
+    deduplicate_photos,
     get_face_embeddings,
     process_photos_batch,
 )
@@ -78,29 +79,33 @@ if run_filter:
 
     reference_embedding = reference_embeddings[0]
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    progress = st.progress(0, text="Decoding uploaded photos")
+    progress = st.progress(0, text="Checking uploads for duplicates")
 
-    uploaded_photos: list[tuple[str, bytes, object]] = []
-    photos_to_process = []
-    for uploaded_file in photo_files:
-        contents = uploaded_file.getvalue()
-        image = decode_image(contents)
-        uploaded_photos.append((uploaded_file.name, contents, image))
-        photos_to_process.append((uploaded_file.name, image))
+    # Read raw bytes only (no decoding yet) so byte-identical re-uploads can be
+    # dropped via a cheap hash before any image is decoded or face-detected.
+    uploaded_bytes = [(uploaded_file.name, uploaded_file.getvalue()) for uploaded_file in photo_files]
+    dedup_result = deduplicate_photos(uploaded_bytes)
+    duplicate_count = len(photo_files) - len(dedup_result.unique_photos)
 
-    progress.progress(0.25, text=f"Processing {len(photo_files)} photos")
-    batch_result = process_photos_batch(photos_to_process, reference_embedding, threshold)
+    progress.progress(0.25, text=f"Processing {len(dedup_result.unique_photos)} unique photo(s)")
+    batch_result = process_photos_batch(dedup_result.unique_photos, reference_embedding, threshold)
     results = batch_result.results
 
     matching_files = [
-        (name, contents)
-        for (name, contents, image), (_, result, _) in zip(uploaded_photos, results)
-        if image is not None and result == "MATCH"
+        (name, dedup_result.representative_bytes[name])
+        for name, result, _ in results
+        if result == "MATCH"
     ]
     for filename, contents in matching_files:
         (OUTPUT_DIR / Path(filename).name).write_bytes(contents)
 
-    progress.progress(1.0, text=f"Processed {len(photo_files)} photos")
+    progress.progress(1.0, text=f"Processed {len(dedup_result.unique_photos)} unique photo(s)")
+    if duplicate_count:
+        st.caption(
+            f"Skipped {duplicate_count} duplicate upload(s) of an already-seen image "
+            f"({len(photo_files)} uploaded, {len(dedup_result.unique_photos)} unique)."
+        )
+
     match_count = len(matching_files)
     if match_count == 0:
         st.info("No matching photos found.")
