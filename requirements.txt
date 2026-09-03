@@ -1,5 +1,6 @@
 deepface==0.0.100
-tf-keras>=2.21.0
+tensorflow==2.20.0
+tf-keras==2.20.1
 opencv-python>=4.8.0
-numpy>=1.24.0
+numpy>=1.24.0,<2.3
 streamlit>=1.40.0
