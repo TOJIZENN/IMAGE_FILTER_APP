@@ -4,7 +4,7 @@ This local Python program finds photos containing the person in a reference imag
 
 ## Requirements
 
-- Python 3.10 through 3.13 (Python 3.11 is recommended on macOS)
+- Python 3.11 is recommended for local runs and Streamlit Community Cloud
 - Internet access for the first model download only; recognition runs locally afterward
 - A CPU is sufficient, though the first run can take some time
 
@@ -103,3 +103,9 @@ The app uses DeepFace's RetinaFace detector because some newer OpenCV builds do 
 - **No matches:** Try a clearer reference image or adjust `FACE_THRESHOLD` carefully. Different lighting, pose, blur, and occlusion affect recognition accuracy.
 
 This project does not train a model, use a database, call a cloud API, or compare filenames or raw pixels.
+
+## Deploy on Streamlit Community Cloud
+
+Use `app.py` as the main file path and select Python 3.11 in Advanced settings. The dependency pins are chosen for the DeepFace 0.0.100, TensorFlow 2.20.0, tf-keras 2.20.1, NumPy 1.26.4, and OpenCV stack.
+
+DeepFace currently declares `opencv-python` as a required dependency, so this deployment uses one pinned `opencv-python` wheel instead of installing both OpenCV distributions. The root `packages.txt` installs `libgl1`, which Streamlit documents as the required system package when non-headless OpenCV is unavoidable on Community Cloud.
